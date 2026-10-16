@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题（私密报告）
+    url: https://github.com/ggbqq0-lang/apple-tv-/security/advisories/new
+    about: 认证、凭据和安全漏洞请勿在公开 Issue 披露。

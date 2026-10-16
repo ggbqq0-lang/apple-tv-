@@ -1,0 +1,1 @@
+https://example.com/api?token=abc123&mode=1

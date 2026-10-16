@@ -1,0 +1,34 @@
+name: 问题反馈
+description: 报告连接、遥控、文字输入或界面问题。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "请仅使用公开测试文字，不提交密码、配对码、凭据、真实订阅或未脱敏日志。"
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      placeholder: 0.5.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 设备与目标应用
+      description: 安卓版本、Apple TV/tvOS 版本（若知道）、目标应用及字段类型。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤及公开样例
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期结果与实际结果
+      description: 请区分手机提示、协议回读与电视实际显示。
+    validations:
+      required: true

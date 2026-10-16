@@ -1,0 +1,24 @@
+# Local tools and generated files
+.tools/
+.private/
+.venv/
+.gradle/
+.kotlin/
+.idea/
+**/build/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.iml
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+.env
+.env.*
+*.apk
+*.aab
+deliverables/
+*.log
+.DS_Store
