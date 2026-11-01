@@ -23,7 +23,7 @@ pycparser==3.11
 pydantic==2.14.1
 pydantic_core==2.50.1
 Pygments==2.21.0
-pytest==9.1.1
+pytest==9.2.0
 requests==2.34.2
 six==1.17.0
 srptools==1.0.1
