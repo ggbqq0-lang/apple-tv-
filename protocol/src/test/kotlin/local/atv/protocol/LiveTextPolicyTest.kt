@@ -25,12 +25,6 @@ class LiveTextPolicyTest {
         assertFalse(policy.bind(current,ByteArray(16){2}))
         assertThrows(ProtocolFailure::class.java){policy.check(ByteArray(16){2})}
     }
-    @Test fun defaultDraftDoesNotRestoreOldOrImportPartialTVContext(){
-        assertEquals("",LiveTextPolicy.draftForEntry("old deleted text",""))
-        assertEquals("",LiveTextPolicy.draftForEntry("draft",null))
-        assertEquals("",LiveTextPolicy.draftForEntry("","partial context before cursor"))
-        assertEquals("same",LiveTextPolicy.draftForEntry("same","same"))
-    }
     @Test fun cannotArmWithoutFocusedSession(){assertThrows(ProtocolFailure::class.java){LiveTextPolicy().arm(null)}}
     @Test fun changingFieldsRevokesLiveWrites(){
         val policy=LiveTextPolicy();val first=ByteArray(16){1};policy.arm(first)

@@ -10,6 +10,11 @@ class RemoteHold(timeoutMillis:Long=15000) {
     init{require(timeoutMillis in 1..15000)}
     fun active()=released.count>0 && System.nanoTime()<deadline
     fun release(){released.countDown()}
+    fun waitForRelease(timeoutMillis:Long):Boolean {
+        require(timeoutMillis in 1..15000)
+        released.await(minOf(timeoutMillis*1000000,(deadline-System.nanoTime()).coerceAtLeast(0)),TimeUnit.NANOSECONDS)
+        return !active()
+    }
     fun awaitRelease(){
         try{released.await((deadline-System.nanoTime()).coerceAtLeast(0),TimeUnit.NANOSECONDS)}finally{release()}
     }

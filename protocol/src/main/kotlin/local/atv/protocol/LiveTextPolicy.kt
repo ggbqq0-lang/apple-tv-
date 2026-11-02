@@ -16,9 +16,4 @@ class LiveTextPolicy {
     fun active()=target!=null
     /** Keep the authorized target while stopping the debounced live worker. */
     @Synchronized fun snapshot():LiveTextPolicy?=target?.let{session->LiveTextPolicy().apply{arm(session)}}
-    companion object {
-        // contextBeforeInput is not guaranteed to be a complete document. Never
-        // import it as the full editable value, or restore a stale local draft.
-        fun draftForEntry(local:String,contextBeforeInput:String?):String=if(local==contextBeforeInput)local else ""
-    }
 }

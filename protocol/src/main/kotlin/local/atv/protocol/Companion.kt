@@ -150,17 +150,17 @@ data class TextState(val focused: Boolean,val sessionId: ByteArray?=null,val con
 }
 data class SendResult(val contextMatches: Boolean?,val characters: Int,val utf8Bytes: Int)
 
-class Companion(endpoint: Endpoint, private val credentials: Credentials) : Closeable {
+class Companion(endpoint: Endpoint, private val credentials: Credentials) : RemoteSession {
     private val channel=Channel(endpoint)
     private var authenticated=false
     @Volatile private var selectHold:RemoteHold?=null
-    var focused=false;private set
-    var supportsVolume=false;private set
-    var supportsVolumeSteps=false;private set
+    override var focused=false;private set
+    override var supportsVolume=false;private set
+    override var supportsVolumeSteps=false;private set
     private var sid=0L
     private var textStarted=false
     private var touchTimestamp=System.nanoTime()
-    fun connect(){
+    override fun connect(){
         val ephemeral=Crypto.random(32);val clientPublic=Crypto.xPublic(ephemeral)
         val m2=channel.auth(5,linkedMapOf(6 to byteArrayOf(1),3 to clientPublic),mapOf("_auTy" to 4))
         ensure(m2.required(6).contentEquals(byteArrayOf(2)),"VERIFY_SEQUENCE")
@@ -190,7 +190,7 @@ class Companion(endpoint: Endpoint, private val credentials: Credentials) : Clos
         refreshText()
     }
     private fun request(id: String,content: Map<String,Any?> = emptyMap()): Map<String,Any?> {ensure(authenticated,"PAIRING_REQUIRED");return channel.request(id,content)}
-    fun refreshText(): TextState {
+    override fun refreshText(): TextState {
         if(textStarted)request("_tiStop")
         val content=request("_tiStart")["_c"] as? Map<*,*>
         textStarted=true
@@ -200,7 +200,7 @@ class Companion(endpoint: Endpoint, private val credentials: Credentials) : Clos
         val uuid=Rti.session(archive);ensure(uuid?.size==16,"RTI_SESSION_UUID")
         return TextState(true,uuid,Rti.context(archive))
     }
-    fun sendText(text: String,append: Boolean,confirmReplace: Boolean,livePolicy: LiveTextPolicy?=null): SendResult {
+    override fun sendText(text: String,append: Boolean,confirmReplace: Boolean,livePolicy: LiveTextPolicy?): SendResult {
         ensure(append || confirmReplace,"REPLACE_CONFIRMATION_REQUIRED")
         ensure(!text.any {it.isSurrogate()} || validSurrogates(text),"INVALID_UNICODE")
         val encoded=utf8(text);ensure(encoded.size<=65536,"LOCAL_TEXT_LIMIT_64K")
@@ -216,7 +216,7 @@ class Companion(endpoint: Endpoint, private val credentials: Credentials) : Clos
             return SendResult(matches,text.codePointCount(0,text.length),encoded.size)
         }catch(_:Exception){throw ProtocolFailure("WRITE_OUTCOME_UNKNOWN")}
     }
-    fun press(command: Int,hold:Boolean=false){
+    override fun press(command: Int,hold:Boolean){
         ensure(command in listOf(1,2,3,4,5,6,7,8,9,14),"REMOTE_UNSUPPORTED")
         val action:()->Unit={
             ensure(authenticated,"PAIRING_REQUIRED");channel.pressAndRelease(command,hold)
@@ -226,8 +226,8 @@ class Companion(endpoint: Endpoint, private val credentials: Credentials) : Clos
             try{action()}catch(e:ProtocolFailure){if(e.code!="COMMAND_REJECTED")throw e;supportsVolumeSteps=false;throw ProtocolFailure("VOLUME_KEYS_UNAVAILABLE")}
         }else action()
     }
-    fun power(wake:Boolean){request("_hidC",mapOf("_hBtS" to 2,"_hidC" to if(wake)13 else 12))}
-    fun holdSelect(held:RemoteHold){
+    override fun power(wake:Boolean){request("_hidC",mapOf("_hBtS" to 2,"_hidC" to if(wake)13 else 12))}
+    override fun holdSelect(held:RemoteHold){
         ensure(authenticated,"PAIRING_REQUIRED")
         selectHold=held
         try{channel.pressAndRelease(6,held=held)}finally{if(selectHold===held)selectHold=null}
@@ -240,13 +240,13 @@ class Companion(endpoint: Endpoint, private val credentials: Credentials) : Clos
         }
     }
     private fun audioRequest(content:Map<String,Any?>)=withAudioSupport{request("_mcc",content)}
-    fun volume():Double {
+    override fun volume():Double {
         val level=(audioRequest(mapOf("_mcc" to 5))["_c"] as? Map<*,*>)?.get("_vol") as? Number
         if(level==null || !level.toDouble().isFinite() || level.toDouble() !in 0.0..1.0){supportsVolume=false;throw ProtocolFailure("AUDIO_UNSUPPORTED")}
         return level.toDouble()
     }
     fun setVolume(level:Double){ensure(level.isFinite() && level in 0.0..1.0,"VOLUME_RANGE");audioRequest(mapOf("_mcc" to 6,"_vol" to level))}
-    fun setVolumeVerified(level:Double){
+    override fun setVolumeVerified(level:Double){
         setVolume(level)
         repeat(10){Thread.sleep(100);if(kotlin.math.abs(volume()-level)<.005)return}
         throw ProtocolFailure("MUTE_UNAVAILABLE")
