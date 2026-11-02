@@ -31,6 +31,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -79,25 +81,39 @@ class MainActivity: ComponentActivity() {
 private fun RemoteApp(model:RemoteViewModel){
     val state by model.state.collectAsStateWithLifecycle()
     var tab by remember{mutableIntStateOf(0)}
+    var targetMenu by remember{mutableStateOf(false)}
     var pin by remember(state.pairing){mutableStateOf("")}
     val focus=LocalFocusManager.current
     val keyboard=LocalSoftwareKeyboardController.current
     fun switchTo(value:Int){if(tab==1 && value!=1){model.disableLive();focus.clearFocus();keyboard?.hide()};tab=value}
+    // React to TV field changes, never to the selected tab: manual dismissal
+    // stays dismissed until the TV presents another field or reconnects.
+    LaunchedEffect(state.connected,state.focused,state.tvInputRevision,state.pairing){
+        if(state.connected && state.focused && !state.pairing)switchTo(1)
+        else if(tab==1)switchTo(0)
+    }
     BackHandler(enabled=tab!=0){switchTo(0)}
     Scaffold(Modifier.fillMaxSize().safeDrawingPadding().imePadding(),bottomBar={
         NavigationBar(windowInsets=WindowInsets(0)){
             listOf("遥控","键盘","设备").forEachIndexed{i,label->
-                NavigationBarItem(selected=tab==i,onClick={switchTo(i)},icon={Text(listOf("◉","⌨","⚙")[i],style=MaterialTheme.typography.titleLarge)},label={Text(label)})
+                NavigationBarItem(selected=tab==i,onClick={switchTo(i)},enabled=i!=1 || state.target==ControlTarget.APPLE_TV,icon={Text(listOf("◉","⌨","⚙")[i],style=MaterialTheme.typography.titleLarge)},label={Text(label)})
             }
         }
     }){padding->Column(Modifier.fillMaxSize().padding(padding)){
         Row(Modifier.fillMaxWidth().padding(horizontal=20.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)){
             Text("●",color=if(state.connected)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)
             Column(Modifier.weight(1f)){
-                Text(if(state.connected)state.device else if(state.busy)"正在连接…" else "Apple TV",style=MaterialTheme.typography.titleMedium,maxLines=1,overflow=TextOverflow.Ellipsis)
+                Text(if(state.connected)state.device else if(state.busy)"正在连接…" else if(state.target==ControlTarget.XIAOMI_TV)"小米电视" else "Apple TV",style=MaterialTheme.typography.titleMedium,maxLines=1,overflow=TextOverflow.Ellipsis)
                 Text(if(state.connected)"已连接" else "${state.message}",style=MaterialTheme.typography.labelSmall,maxLines=1,overflow=TextOverflow.Ellipsis,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if(!state.connected)TextButton(onClick={switchTo(2)}){Text("设备")}
+            Box{
+                TextButton(onClick={targetMenu=true},enabled=!state.busy && !state.pairing){Text("切换设备")}
+                DropdownMenu(expanded=targetMenu,onDismissRequest={targetMenu=false}){
+                    DropdownMenuItem(text={Text("Apple TV")},onClick={targetMenu=false;switchTo(0);model.useAppleTv()})
+                    DropdownMenuItem(text={Text("小米电视")},onClick={targetMenu=false;if(state.xiaomiHost.isBlank())switchTo(2) else {switchTo(0);model.useXiaomiTv()}})
+                }
+            }
         }
         when(tab){0->RemotePage(state,model){switchTo(1)};1->KeyboardPage(state,model);2->DevicePage(state,model)}
     }}
@@ -115,8 +131,8 @@ private fun RemotePage(state:ScreenState,model:RemoteViewModel,onKeyboard:()->Un
         val keySize=if(maxHeight<560.dp)56.dp else 64.dp
         Column(Modifier.fillMaxSize(),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(8.dp)){
             Row(Modifier.fillMaxWidth().height(40.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.SpaceBetween){
-                Text("轻按唤醒 · 长按睡眠",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                RemoteKey(RemoteGlyph.Power,"电源",keys,Modifier.size(40.dp),showLabel=false,
+                Text(if(state.target==ControlTarget.APPLE_TV)"轻按唤醒 · 长按睡眠" else "小米电视 · 局域网直连",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                RemoteKey(RemoteGlyph.Power,"电源",keys && state.powerAvailable,Modifier.size(40.dp),showLabel=false,
                     longLabel="使 Apple TV 睡眠",onLongClick={model.power(false)}){model.power(true)}
             }
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(),contentAlignment=Alignment.Center){
@@ -128,19 +144,19 @@ private fun RemotePage(state:ScreenState,model:RemoteViewModel,onKeyboard:()->Un
             Column(horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(8.dp)){
                 Row(horizontalArrangement=Arrangement.spacedBy(44.dp)){
                     RemoteKey(RemoteGlyph.Back,"返回",keys,Modifier.size(keySize),longLabel="长按返回主屏幕",onLongClick={model.remote(5,true)}){model.remote(5)}
-                    RemoteKey(RemoteGlyph.TV,"TV",keys,Modifier.size(keySize),longLabel="打开控制中心",onLongClick={model.remote(7,true)}){model.remote(7)}
+                    RemoteKey(RemoteGlyph.TV,if(state.target==ControlTarget.APPLE_TV)"TV" else "主页",keys,Modifier.size(keySize),longLabel=if(state.target==ControlTarget.APPLE_TV)"打开控制中心" else "最近任务",onLongClick={model.remote(7,true)}){model.remote(7)}
                 }
                 Row(horizontalArrangement=Arrangement.spacedBy(44.dp)){
                     Column(verticalArrangement=Arrangement.spacedBy(8.dp)){
                         RemoteKey(RemoteGlyph.PlayPause,"播放/暂停",keys,Modifier.size(keySize)){model.remote(14)}
-                        RemoteKey(RemoteGlyph.Mute,if(state.muted)"取消静音" else "静音",keys && state.muteAvailable,Modifier.size(keySize)){model.mute()}
+                        RemoteKey(RemoteGlyph.Mute,if(state.muteThroughTelevision)"静音切换" else if(state.muted)"取消静音" else "静音",keys && state.muteAvailable,Modifier.size(keySize)){model.mute()}
                     }
                     VolumeRocker(keys && state.volumeAvailable,Modifier.width(keySize).height(keySize*2+8.dp),model)
                 }
             }
             Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(10.dp)){
                 ConfirmButton(available,model,Modifier.weight(1f).height(44.dp))
-                FilledTonalButton(onClick=onKeyboard,modifier=Modifier.weight(1f).height(44.dp)){Text("文字键盘")}
+                FilledTonalButton(onClick=onKeyboard,enabled=state.target==ControlTarget.APPLE_TV,modifier=Modifier.weight(1f).height(44.dp)){Text("文字键盘")}
             }
             Spacer(Modifier.height(4.dp))
         }
@@ -310,11 +326,21 @@ private fun RemoteIcon(glyph:RemoteGlyph,ink:Color,modifier:Modifier){
 @Composable
 private fun KeyboardPage(state:ScreenState,model:RemoteViewModel){
     val context=LocalContext.current
-    var editor by remember{mutableStateOf(TextFieldValue(state.text,TextRange(state.text.length)))}
+    val focusRequester=remember{FocusRequester()}
+    val focus=LocalFocusManager.current
+    val keyboard=LocalSoftwareKeyboardController.current
+    var editor by remember(state.fieldRevision){mutableStateOf(TextFieldValue(state.text,TextRange(state.text.length)))}
     LaunchedEffect(state.text){if(editor.text!=state.text)editor=TextFieldValue(state.text,TextRange(state.text.length))}
-    var confirmReplace by remember{mutableStateOf(false)}
+    var confirmReplace by remember(state.fieldRevision){mutableStateOf(false)}
     DisposableEffect(model){model.enterKeyboard();onDispose{model.leaveKeyboard()}}
-    var note by remember{mutableStateOf("")}
+    LaunchedEffect(state.fieldRevision,state.focused,state.livePending){
+        if(state.focused && !state.livePending){
+            withFrameNanos { }
+            focusRequester.requestFocus()
+            keyboard?.show()
+        }else if(!state.focused){focus.clearFocus();keyboard?.hide()}
+    }
+    var note by remember(state.fieldRevision){mutableStateOf("")}
     Column(Modifier.fillMaxSize().padding(horizontal=18.dp)){
       Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(10.dp)){
         Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.SpaceBetween){
@@ -324,7 +350,7 @@ private fun KeyboardPage(state:ScreenState,model:RemoteViewModel){
             }
             Switch(checked=state.live || state.livePending,onCheckedChange={if(it)model.enableLive() else model.disableLive()},enabled=!state.busy || state.live || state.livePending)
         }
-        OutlinedTextField(value=editor,onValueChange={editor=it;model.edit(it.text,it.composition!=null)},modifier=Modifier.fillMaxWidth().heightIn(min=120.dp,max=210.dp),
+        OutlinedTextField(value=editor,onValueChange={editor=it;model.edit(it.text,it.composition!=null,state.fieldRevision)},modifier=Modifier.fillMaxWidth().heightIn(min=120.dp,max=210.dp).focusRequester(focusRequester),
             label={Text("输入或粘贴文字")},enabled=!state.livePending,
             keyboardOptions=KeyboardOptions(autoCorrectEnabled=false,keyboardType=KeyboardType.Text),
             supportingText={Text("${state.text.codePointCount(0,state.text.length)} 字符 · ${if(state.focused)"电视有输入焦点" else "电视无输入焦点"}")})
@@ -332,7 +358,7 @@ private fun KeyboardPage(state:ScreenState,model:RemoteViewModel){
             OutlinedButton(onClick={
                 val manager=context.getSystemService(ClipboardManager::class.java);val clip=manager.primaryClip
                 val value=if(clip!=null && clip.itemCount>0)clip.getItemAt(0).text else null
-                if(value!=null){model.edit(value.toString());note=if(state.live)"已读取，正在实时同步。" else "已读取；点击发送即可。"}else note="剪贴板没有文字。"
+                if(value!=null){model.edit(value.toString(),fieldRevision=state.fieldRevision);note=if(state.live)"已读取，正在实时同步。" else "已读取；点击发送即可。"}else note="剪贴板没有文字。"
             },enabled=!state.livePending,modifier=Modifier.weight(1f)){Text("读取剪贴板")}
             OutlinedButton(onClick={model.clearLocal();note="手机内容已清除，实时同步已关闭。"},modifier=Modifier.weight(1f)){Text("清除手机内容")}
         }
@@ -348,7 +374,7 @@ private fun KeyboardPage(state:ScreenState,model:RemoteViewModel){
         if(state.busy)LinearProgressIndicator(Modifier.fillMaxWidth())
         Text(state.message,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
         if(state.needsReview)Button(onClick=model::acknowledge,enabled=!state.busy){Text("我已查看电视结果")}
-        Text("默认实时同步，中文确认选字后发送。操作下方遥控键会先同步已确认的文字，再暂停同步；开启开关可继续输入。",style=MaterialTheme.typography.bodySmall)
+        Text("电视进入输入框时自动弹出手机键盘，退出输入后回到遥控页。切换输入框会更新手机内容；电视不提供文字时清空。中文确认选字后同步；遥控暂停发送，进入新框后恢复，手动关闭时保持关闭。",style=MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
       }
       HorizontalDivider()
@@ -386,16 +412,44 @@ private fun KeyboardRemote(state:ScreenState,model:RemoteViewModel){
 @Composable
 private fun DevicePage(state:ScreenState,model:RemoteViewModel){
     var manual by remember{mutableStateOf(false)}
+    var xiaomi by remember{mutableStateOf(false)}
     var info by remember{mutableStateOf(false)}
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal=18.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         Text("设备管理",style=MaterialTheme.typography.titleLarge)
         Text(state.message,style=MaterialTheme.typography.bodyMedium)
         if(state.busy)LinearProgressIndicator(Modifier.fillMaxWidth())
         Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
-            OutlinedButton(onClick=model::scan,enabled=!state.busy && !state.pairing){Text("搜索设备")}
+            OutlinedButton(onClick=model::scan,enabled=!state.busy && !state.pairing){Text("搜索 Apple TV")}
             OutlinedButton(onClick=model::reconnect,enabled=!state.busy && !state.pairing){Text("重新连接")}
             if(state.connected)TextButton(onClick=model::disconnect){Text("断开")}
         }
+        Text("小米电视",style=MaterialTheme.typography.titleMedium)
+        if(state.xiaomiHost.isNotBlank())OutlinedCard(Modifier.fillMaxWidth()){
+            Column(Modifier.padding(14.dp)){
+                Text("小米电视 · 局域网直连",fontWeight=FontWeight.SemiBold)
+                Text(state.xiaomiHost,style=MaterialTheme.typography.bodySmall)
+                Row{
+                    TextButton(onClick=model::useXiaomiTv,enabled=!state.busy && !state.pairing){Text("连接小米电视")}
+                    TextButton(onClick={xiaomi=true},enabled=!state.busy && !state.pairing){Text("修改 IP")}
+                    TextButton(onClick=model::forgetXiaomi,enabled=!state.busy && !state.pairing){Text("删除")}
+                }
+            }
+        }else OutlinedButton(onClick={xiaomi=true},enabled=!state.busy && !state.pairing,modifier=Modifier.fillMaxWidth()){Text("添加小米电视")}
+        Text("手机与电视连接同一局域网，电视保持开机。首次填写电视 IP；不需要红外或 ADB 调试。",style=MaterialTheme.typography.bodySmall)
+        HorizontalDivider()
+        if(state.target==ControlTarget.APPLE_TV && state.connected && state.xiaomiHost.isNotBlank()){
+            OutlinedCard(Modifier.fillMaxWidth()){
+                Row(Modifier.padding(14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(12.dp)){
+                    Column(Modifier.weight(1f)){
+                        Text("用小米电视切换静音",fontWeight=FontWeight.SemiBold)
+                        Text("仅绑定当前 Apple TV；方向和输入仍控制 Apple TV。",style=MaterialTheme.typography.bodySmall)
+                    }
+                    Switch(checked=state.muteThroughTelevision,onCheckedChange=model::linkCurrentMute,
+                        enabled=!state.busy && !state.pairing,modifier=Modifier.semantics{contentDescription="用小米电视切换静音"})
+                }
+            }
+        }
+        Text("已配对的 Apple TV",style=MaterialTheme.typography.titleMedium)
         state.saved.forEach{device->OutlinedCard(Modifier.fillMaxWidth()){
             Column(Modifier.padding(14.dp)){
                 Text(device.endpoint.name,fontWeight=FontWeight.SemiBold)
@@ -410,9 +464,15 @@ private fun DevicePage(state:ScreenState,model:RemoteViewModel){
         }}
         OutlinedButton(onClick={manual=true},enabled=!state.busy && !state.pairing,modifier=Modifier.fillMaxWidth()){Text("手动填写 IP 和端口")}
         TextButton(onClick={info=true}){Text("遥控说明与隐私")}
-        Text(if(state.connected && state.muteAvailable)"当前输出可用网络静音切换。" else "音量加减与静音分别判断。未确认支持静音时按钮变灰。",style=MaterialTheme.typography.bodySmall)
-        Text("0.5.0 · 手机直接连接 Apple TV",style=MaterialTheme.typography.labelSmall)
+        Text(if(state.muteThroughTelevision)"静音切换控制小米电视，按一次静音、再按恢复，实际状态以电视为准。" else if(state.connected && state.muteAvailable)"当前输出可用网络静音切换。" else "音量加减与静音分别判断。未确认支持静音时按钮变灰。",style=MaterialTheme.typography.bodySmall)
+        Text("0.6.2 · 手机直接连接电视",style=MaterialTheme.typography.labelSmall)
         Spacer(Modifier.height(12.dp))
+    }
+    if(xiaomi){var host by remember{mutableStateOf(state.xiaomiHost)}
+        AlertDialog(onDismissRequest={xiaomi=false},title={Text("连接小米电视")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){
+            Text("填写电视网络设置中的 IPv4 或 IPv6 地址。连接只检查服务，不发送遥控按键。")
+            OutlinedTextField(host,{host=it},label={Text("电视局域网 IP")},singleLine=true,keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Ascii))
+        }},confirmButton={TextButton(onClick={xiaomi=false;model.addXiaomi(host)},enabled=host.isNotBlank()){Text("连接电视")}},dismissButton={TextButton(onClick={xiaomi=false}){Text("取消")}})
     }
     if(manual){var host by remember{mutableStateOf("")};var port by remember{mutableStateOf("49153")}
         AlertDialog(onDismissRequest={manual=false},title={Text("手动连接")},text={Column(verticalArrangement=Arrangement.spacedBy(10.dp)){
@@ -421,5 +481,5 @@ private fun DevicePage(state:ScreenState,model:RemoteViewModel){
             OutlinedTextField(port,{port=it},label={Text("Companion 端口")},singleLine=true,keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number))
         }},confirmButton={TextButton(onClick={manual=false;model.manual(host,port)}){Text("发起配对")}},dismissButton={TextButton(onClick={manual=false}){Text("取消")}})
     }
-    if(info)AlertDialog(onDismissRequest={info=false},title={Text("遥控说明与隐私")},text={Column(Modifier.verticalScroll(rememberScrollState())){Text("圆环点按方向，中央轻点确定，按住中央或独立确定可持续长按；松手、移出或切后台释放，单次最多 15 秒。先选中电视键盘退格可连续删除（视目标应用支持）。整个圆盘都可滑动，滑动转换为有间隔的方向短按，松手停止，不带惯性。返回键长按回主屏幕；TV 键长按开控制中心，轻按行为取决于电视设置。电源轻按唤醒 Apple TV，长按睡眠，是否联动电视取决于 HDMI-CEC。\n\n音量加减与静音按各自支持情况启用。仅能读取有效音量并确认设定结果时，静音通过音量归零和恢复实现。读数为零不代表电视已静音；无法确认支持时灰显，绝不自动发出音量加。未实现 Siri 语音、红外和绕圈时间线。\n\n手机直接连接 Apple TV，不需要 Mac 中转。无广告、统计或云服务。剪贴板仅主动点击读取，文字不持久化，凭据由 Android Keystore 加密。\n\n每次进入键盘默认实时同步，准备好当前电视输入框后，从下一次编辑开始替换。可关闭开关改为手动发送；输入框变化或连接异常时暂停。\n\n协议参考 pyatv 0.18.0（MIT，Pierre Ståhl）；加密使用 Bouncy Castle（MIT）。某些第三方应用可能不支持远程文字或触摸输入。")}},confirmButton={TextButton(onClick={info=false}){Text("知道了")}})
+    if(info)AlertDialog(onDismissRequest={info=false},title={Text("遥控说明与隐私")},text={Column(Modifier.verticalScroll(rememberScrollState())){Text("圆环点按方向，中央轻点确定，按住中央或独立确定可持续长按；松手、移出或切后台释放，单次最多 15 秒。先选中电视键盘退格可连续删除（视目标应用支持）。整个圆盘都可滑动，滑动转换为有间隔的方向短按，松手停止，不带惯性。返回键长按回主屏幕；Apple TV 模式的 TV 键长按开控制中心，轻按行为取决于电视设置。小米电视模式的主页键长按打开最近任务。电源轻按唤醒 Apple TV，长按睡眠，是否联动电视取决于 HDMI-CEC。\n\n小米电视的静音切换按一次静音、再按恢复，以电视实际声音为准。Apple TV 模式可在设备页为当前 Apple TV 开启小米电视静音联动，仅静音键发送给小米电视，其他操作仍控制 Apple TV。更换小米电视 IP 后需重新开启联动。未开启联动时，Apple TV 模式的音量加减与静音按各自支持情况启用。仅能读取有效音量并确认设定结果时，静音通过音量归零和恢复实现。读数为零不代表电视已静音；无法确认支持时灰显，绝不自动发出音量加。未实现 Siri 语音、红外和绕圈时间线。\n\n手机直接连接 Apple TV 或小米电视，不需要 Mac 中转。小米电视通过局域网连接，无需红外或 ADB；本版支持基础遥控和音量加减，文字输入与电源暂未开放，静音使用电视系统的切换按键。无广告、统计或云服务。剪贴板仅主动点击读取，文字不持久化，凭据由 Android Keystore 加密。\n\nApple TV 模式前台连接时，电视进入输入框会自动打开手机键盘页和输入法，退出输入后收起并回到遥控页。可以手动切回其他页面，同一个输入框不会反复弹出。每次进入键盘默认实时同步，先读取当前电视输入框，从下一次编辑开始替换。切换输入框时更新为新框内容，电视不提供文字时清空旧内容。操作遥控暂停发送，进入新框后自动恢复；手动关闭开关时保持关闭。连接异常时停止发送。\n\n协议参考 pyatv 0.18.0（MIT，Pierre Ståhl）；加密使用 Bouncy Castle（MIT）。某些第三方应用可能不支持远程文字或触摸输入。")}},confirmButton={TextButton(onClick={info=false}){Text("知道了")}})
 }

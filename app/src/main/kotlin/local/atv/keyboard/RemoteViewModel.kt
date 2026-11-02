@@ -15,26 +15,31 @@ import java.net.SocketTimeoutException
 
 data class ScreenState(
     val found: List<Endpoint> = emptyList(),val saved: List<SavedDevice> = emptyList(),
+    val target:ControlTarget=ControlTarget.APPLE_TV,val xiaomiHost:String="",val powerAvailable:Boolean=true,
     val device: String="尚未连接",val connected: Boolean=false,val focused: Boolean=false,
-    val busy: Boolean=false,val pairing: Boolean=false,val text: String="",
+    val busy: Boolean=false,val pairing: Boolean=false,val text: String="",val fieldRevision:Long=0,val tvInputRevision:Long=0,
     val append: Boolean=false,val needsReview: Boolean=false,
     val message: String="手机与 Apple TV 请接入同一局域网。",val scanning: Boolean=false,
     val touching: Boolean=false,val live: Boolean=false,val livePending:Boolean=false,
-    val volumeAvailable:Boolean=false,val muteAvailable:Boolean=false,val muted:Boolean=false,
+    val volumeAvailable:Boolean=false,val muteAvailable:Boolean=false,val muted:Boolean=false,val muteThroughTelevision:Boolean=false,
 )
 
 class RemoteViewModel(application: Application): AndroidViewModel(application) {
     private val store=DeviceStore(application)
-    private val mutable=MutableStateFlow(ScreenState(saved=store.devices()))
+    private val settings=RemoteSettings(application)
+    private val mutable=MutableStateFlow(ScreenState(saved=store.devices(),target=settings.target(),xiaomiHost=settings.host(),powerAvailable=settings.target()==ControlTarget.APPLE_TV))
     val state=mutable.asStateFlow()
     private val lock=Mutex()
-    @Volatile private var connection: Companion?=null
+    @Volatile private var connection: RemoteSession?=null
+    @Volatile private var appleConnectionId:String?=null
+    private val linkedTvMute=LinkedTvMute()
     @Volatile private var pairing: Pairing?=null
     private var pairingTarget: Endpoint?=null
     private var selected: SavedDevice?=store.last()
     @Volatile private var foreground=false
     private var reconnect=true
     private var poll: Job?=null
+    private val pollWake=kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
     private var expiry: Job?=null
     private var retryAt=0L
     private var failures=0
@@ -48,11 +53,15 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
     private val networkMute=NetworkMute()
     @Volatile private var keyboardVisible=false
     private var bindingRequest=0L
-    private var resetDraftOnBind=false
+    private val keyboardField=KeyboardFieldTracker()
+    // TV focus outlives the phone editor, including a manual tab change.
+    private val tvKeyboardField=KeyboardFieldTracker()
+    @Volatile private var keyboardEpoch=0L
+    @Volatile private var followLive=false
     private var padHold:RemoteHold?=null
     private var keyboardNavigation:KeyboardNavigation?=null
     private var padNavigation:KeyboardNavigation?=null
-    private data class Control(val client:Companion,val action:(Companion)->Unit)
+    private data class Control(val client:RemoteSession,val action:(RemoteSession)->Unit)
     private val inputs=RemoteInputBuffer<Control>()
     private val inputWake=kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
     private var nextGesture=0L
@@ -75,6 +84,7 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
                         if(foreground && connection===next.value.client && inputs.valid(next,SystemClock.elapsedRealtime())){
                             next.value.action(next.value.client)
                             if(next.gesture!=null)lastMovement=SystemClock.elapsedRealtime()
+                            pollWake.trySend(Unit)
                         }
                     }
                 }
@@ -87,17 +97,20 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         if(keyboardVisible)enableLive(resetDraft=true)
         if(poll?.isActive==true)return
         poll=viewModelScope.launch {
+            var nextAudioAt=0L
             while(isActive && foreground){
                 if(!mutable.value.busy && !mutable.value.pairing){
                     if(connection!=null)operation(quiet=true){
-                        val client=connection!!;val token=bindingRequest;val current=client.refreshText()
-                        mutable.update{it.copy(focused=current.focused)}
-                        refreshAudio(client)
+                        val client=connection!!;val token=bindingRequest;val epoch=keyboardEpoch;val current=client.refreshText()
+                        observeKeyboardField(client,current,epoch)
+                        if(SystemClock.elapsedRealtime()>=nextAudioAt){refreshAudio(client);nextAudioAt=SystemClock.elapsedRealtime()+4000}
                         completeLiveBinding(client,current,token)
-                        if(mutable.value.live)livePolicy.check(current.sessionId)
                     }
-                    else if(reconnect && selected!=null && System.currentTimeMillis()>=retryAt)connect(selected!!)
-                };delay(4000)
+                    else if(reconnect && System.currentTimeMillis()>=retryAt){
+                        if(mutable.value.target==ControlTarget.XIAOMI_TV){if(settings.host().isNotBlank())connectXiaomi(settings.host())}
+                        else selected?.let{connect(it)}
+                    }
+                };withTimeoutOrNull(600L){pollWake.receive()}
             }
         }
     }
@@ -105,43 +118,69 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         cancelKeyboardNavigation()
         disableLive();padHold?.release();padHold=null;inputs.clear();activeGesture=null;mutable.update{it.copy(touching=false)}
         foreground=false;poll?.cancel();poll=null;expiry?.cancel();discovery.stop()
-        connection?.close();connection=null;pairing?.close();pairing=null
+        closeConnection();pairing?.close();pairing=null
         networkMute.reset()
-        mutable.update{it.copy(connected=false,focused=false,pairing=false,scanning=false,volumeAvailable=false,muteAvailable=false,muted=false,
+        mutable.update{it.copy(connected=false,focused=false,pairing=false,scanning=false,volumeAvailable=false,muteAvailable=false,muted=false,muteThroughTelevision=false,
             message="应用已离开前台，连接已断开；返回后自动重连。")}
     }
-    fun edit(text: String,isComposing: Boolean=false){
+    fun edit(text: String,isComposing: Boolean=false,fieldRevision:Long=mutable.value.fieldRevision){
+        if(fieldRevision!=mutable.value.fieldRevision)return
         val changed=text!=mutable.value.text || composing!=isComposing
         composing=isComposing;mutable.update{it.copy(text=text)}
         if(changed){editRevision++;if(mutable.value.live && !composing)startLiveWorker()}
     }
     fun append(value: Boolean){mutable.update{it.copy(append=value)}}
     fun clearLocal(){cancelKeyboardNavigation();disableLive();composing=false;mutable.update{it.copy(text="")}}
-    fun enterKeyboard(){keyboardVisible=true;enableLive(resetDraft=true)}
-    fun leaveKeyboard(){keyboardVisible=false;cancelKeyboardNavigation();disableLive()}
+    fun enterKeyboard(){if(mutable.value.target!=ControlTarget.APPLE_TV)return;keyboardVisible=true;resetKeyboardField();enableLive()}
+    fun leaveKeyboard(){keyboardVisible=false;keyboardEpoch++;cancelKeyboardNavigation();disableLive();keyboardField.reset()}
+    private fun resetKeyboardField(){
+        keyboardEpoch++;keyboardField.reset();composing=false;editRevision++;lastLiveRevision=editRevision
+        mutable.update{it.copy(text="",fieldRevision=it.fieldRevision+1)}
+    }
     fun enableLive(resetDraft:Boolean=false){
-        if(!keyboardVisible)return
+        if(!keyboardVisible || mutable.value.target!=ControlTarget.APPLE_TV)return
         cancelKeyboardNavigation()
-        liveGeneration++;bindingRequest=livePolicy.requestBinding();resetDraftOnBind=resetDraft
-        val token=bindingRequest
+        if(resetDraft)resetKeyboardField()
+        followLive=true;liveGeneration++;bindingRequest=livePolicy.requestBinding()
+        pollWake.trySend(Unit)
+        val token=bindingRequest;val epoch=keyboardEpoch
         mutable.update{it.copy(live=false,livePending=true,append=false,message="实时同步默认开启，正在等待电视输入框。进入页面不会自动发送文字。")}
         val client=connection ?: return
         viewModelScope.launch {operation(quiet=true,waitForLock=true){
-            if(foreground && connection===client){completeLiveBinding(client,client.refreshText(),token)}
+            if(foreground && connection===client){
+                val current=client.refreshText();observeKeyboardField(client,current,epoch);completeLiveBinding(client,current,token)
+            }
         }}
     }
-    private suspend fun completeLiveBinding(client:Companion,current:TextState,token:Long){withContext(Dispatchers.Main.immediate){
+    private suspend fun observeKeyboardField(client:RemoteSession,current:TextState,epoch:Long){withContext(Dispatchers.Main.immediate){
+        if(!foreground || connection!==client || epoch!=keyboardEpoch)return@withContext
+        val tvChange=tvKeyboardField.observe(current)
+        mutable.update{it.copy(focused=current.focused,tvInputRevision=it.tvInputRevision+if(tvChange!=null)1 else 0)}
+        if(!keyboardVisible)return@withContext
+        val change=keyboardField.observe(current) ?: return@withContext
+        cancelKeyboardNavigation();padNavigation?.cancel();padNavigation=null;padHold?.release();padHold=null
+        inputs.clear();activeGesture=null
+        liveGeneration++;livePolicy.stop()
+        composing=false;editRevision++;lastLiveRevision=editRevision
+        if(followLive){bindingRequest=livePolicy.requestBinding();if(change.focused)livePolicy.bind(bindingRequest,current.sessionId)}
+        mutable.update{it.copy(focused=change.focused,text=change.text,fieldRevision=it.fieldRevision+1,
+            touching=false,live=followLive && change.focused,livePending=followLive && !change.focused,append=false,needsReview=false,
+            message=if(!change.focused)"电视输入框已关闭，手机内容已清空，正在等待新输入框。"
+                else if(followLive)"已更新为当前电视输入框内容；从下一次编辑开始实时同步。"
+                else "已更新为当前电视输入框内容，实时同步保持暂停。")}
+    }}
+    private suspend fun completeLiveBinding(client:RemoteSession,current:TextState,token:Long){withContext(Dispatchers.Main.immediate){
         if(!foreground || !keyboardVisible || connection!==client || token!=bindingRequest || !mutable.value.livePending)return@withContext
         mutable.update{it.copy(focused=current.focused)}
         if(!livePolicy.bind(token,current.sessionId))return@withContext
-        val draft=if(resetDraftOnBind)LiveTextPolicy.draftForEntry(mutable.value.text,current.context) else mutable.value.text
         composing=false;editRevision++;lastLiveRevision=editRevision
-        mutable.update{it.copy(live=true,livePending=false,text=draft,append=false,needsReview=false,message="实时同步已开启；从下一次编辑开始替换电视内容，中文选字确认后同步。")}
+        mutable.update{it.copy(live=true,livePending=false,append=false,needsReview=false,message="实时同步已开启；从下一次编辑开始替换电视内容，中文选字确认后同步。")}
     }}
-    fun disableLive(){liveGeneration++;livePolicy.stop();mutable.update{it.copy(live=false,livePending=false)}}
+    fun disableLive(keepFollowing:Boolean=false){if(!keepFollowing)followLive=false;liveGeneration++;livePolicy.stop();mutable.update{it.copy(live=false,livePending=false)}}
     private fun startLiveWorker(){
         if(liveJob?.isActive==true && liveWorkerGeneration==liveGeneration)return
         val generation=liveGeneration
+        val target=livePolicy.snapshot() ?: return
         liveWorkerGeneration=generation
         liveJob=viewModelScope.launch {
             delay(180)
@@ -150,7 +189,7 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
                 operation {
                     if(!foreground || !mutable.value.live || generation!=liveGeneration || composing)return@operation
                     sentRevision=editRevision;val snapshot=mutable.value.text
-                    val result=(connection ?: throw ProtocolFailure("CONNECTION_CLOSED")).sendText(snapshot,false,true,livePolicy)
+                    val result=(connection ?: throw ProtocolFailure("CONNECTION_CLOSED")).sendText(snapshot,false,true,target)
                     if(generation!=liveGeneration || !keyboardVisible)return@operation
                     if(result.contextMatches==true){lastLiveRevision=sentRevision;mutable.update{it.copy(message="实时同步 · 协议回读相符（${result.characters} 字符）")}}
                     else {disableLive();mutable.update{it.copy(needsReview=true,message="实时同步已暂停：无法核对回读或内容不同。请查看电视，确认后可整段发送。")}}
@@ -168,17 +207,17 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         val target=if(mutable.value.live)livePolicy.snapshot() else null
         val pending=mutable.value.text.takeIf{target!=null && editRevision>lastLiveRevision}
         return KeyboardNavigation(pending,target).also{
-            keyboardNavigation=it;disableLive()
+            keyboardNavigation=it;disableLive(keepFollowing=true)
             mutable.update{state->state.copy(message="正在操作电视；文字同步已暂停，可开启开关继续输入。")}
         }
     }
-    private fun keyboardControl(client:Companion,navigation:KeyboardNavigation,action:()->Unit){
+    private fun keyboardControl(client:RemoteSession,navigation:KeyboardNavigation,action:()->Unit){
         navigation.run(current={foreground && keyboardVisible && connection===client},
             send={text,policy->client.sendText(text,false,true,policy)},action=action)
     }
     fun keyboardRemote(command:Int,hold:Boolean=false){
         val s=mutable.value
-        if(!s.connected || s.touching || s.pairing)return
+        if(!s.connected || s.touching || s.pairing || s.target!=ControlTarget.APPLE_TV)return
         val navigation=prepareKeyboardNavigation() ?: return
         control(allowBusy=true){client->keyboardControl(client,navigation){client.press(command,hold)}}
     }
@@ -226,8 +265,9 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         disableLive()
         if(mutable.value.busy)return
         viewModelScope.launch {operation {
-            reconnect=false;connection?.close();connection=null;pairing?.close()
-            mutable.update{it.copy(connected=false,focused=false,device=endpoint.name)}
+            settings.target(ControlTarget.APPLE_TV)
+            reconnect=false;closeConnection();pairing?.close()
+            mutable.update{it.copy(target=ControlTarget.APPLE_TV,powerAvailable=true,connected=false,focused=false,device=endpoint.name)}
             val candidate=Pairing(endpoint);pairing=candidate;pairingTarget=endpoint
             try{candidate.begin()}catch(e:Exception){candidate.close();pairing=null;throw e}
             mutable.update{it.copy(pairing=true,message="请输入 Apple TV 屏幕显示的四位验证码。")}
@@ -251,59 +291,143 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         };if(selected!=null && reconnect)connect(selected!!)}
     }
     fun select(device: SavedDevice){if(mutable.value.busy)return;selected=device;store.select(device.id);reconnect=true;viewModelScope.launch{connect(device)}}
-    fun reconnect(){reconnect=true;retryAt=0;selected?.let{viewModelScope.launch{connect(it)}} ?: scan()}
-    fun disconnect(){cancelKeyboardNavigation();disableLive();padHold?.release();padHold=null;reconnect=false;connection?.close();connection=null;mutable.update{it.copy(connected=false,focused=false,message="已手动断开。")}}
+    fun useAppleTv(){
+        if(mutable.value.busy || mutable.value.pairing)return
+        if(mutable.value.target==ControlTarget.APPLE_TV && connection!=null)return
+        settings.target(ControlTarget.APPLE_TV);disconnect();reconnect=true;retryAt=0
+        mutable.update{it.copy(target=ControlTarget.APPLE_TV,powerAvailable=true,device="Apple TV")}
+        selected?.let{viewModelScope.launch{connect(it)}} ?: scan()
+    }
+    fun useXiaomiTv(){
+        if(mutable.value.busy || mutable.value.pairing || (mutable.value.target==ControlTarget.XIAOMI_TV && connection!=null))return
+        settings.host().takeIf{it.isNotBlank()}?.let{addXiaomi(it)}
+    }
+    fun addXiaomi(host:String){
+        if(mutable.value.busy || mutable.value.pairing)return
+        val value=host.trim()
+        if(value.isBlank()){mutable.update{it.copy(message="请填写电视的局域网 IP。")};return}
+        viewModelScope.launch{connectXiaomi(value)}
+    }
+    fun forgetXiaomi(){
+        if(mutable.value.busy || mutable.value.pairing)return
+        if(mutable.value.target==ControlTarget.XIAOMI_TV)useAppleTv()
+        linkedTvMute.cancel();inputs.clear();settings.forgetXiaomi();networkMute.reset()
+        mutable.update{it.copy(xiaomiHost="",muteThroughTelevision=false,muteAvailable=false,muted=false)};pollWake.trySend(Unit)
+    }
+    fun reconnect(){
+        reconnect=true;retryAt=0
+        if(mutable.value.target==ControlTarget.XIAOMI_TV){settings.host().takeIf{it.isNotBlank()}?.let{viewModelScope.launch{connectXiaomi(it)}}}
+        else selected?.let{viewModelScope.launch{connect(it)}} ?: scan()
+    }
+    private fun closeConnection(){
+        val old=connection;connection=null;appleConnectionId=null
+        linkedTvMute.cancel();old?.close()
+    }
+    fun disconnect(){cancelKeyboardNavigation();disableLive();padHold?.release();padHold=null;reconnect=false;closeConnection();mutable.update{it.copy(connected=false,focused=false,volumeAvailable=false,muteAvailable=false,muted=false,muteThroughTelevision=false,message="已手动断开。")}}
     fun forget(device: SavedDevice){
-        if(selected?.id==device.id){disconnect();selected=null};store.forget(device.id)
+        if(selected?.id==device.id){if(mutable.value.target==ControlTarget.APPLE_TV)disconnect();selected=null};settings.linkMute(device.id,false);store.forget(device.id)
         mutable.update{it.copy(saved=store.devices(),message="已删除本机保存的配对；电视端仍可在遥控器设置中移除该记录。")}
     }
     private suspend fun connect(device: SavedDevice){operation {
+        settings.target(ControlTarget.APPLE_TV)
+        mutable.update{it.copy(target=ControlTarget.APPLE_TV,powerAvailable=true)}
         cancelKeyboardNavigation()
+        withContext(Dispatchers.Main.immediate){
+            disableLive(keepFollowing=true);resetKeyboardField();tvKeyboardField.reset()
+            if(keyboardVisible && followLive){bindingRequest=livePolicy.requestBinding();mutable.update{it.copy(livePending=true)}}
+        }
         padHold?.release();padHold=null;inputs.clear();activeGesture=null;mutable.update{it.copy(touching=false)}
-        connection?.close();connection=null
+        closeConnection()
         networkMute.reset()
-        mutable.update{it.copy(connected=false,focused=false,volumeAvailable=false,muteAvailable=false,muted=false,device=device.endpoint.name,message="正在认证并建立加密连接…")}
-        val candidate=Companion(device.endpoint,store.credentials(device.id));connection=candidate
-        try{candidate.connect();failures=0;retryAt=0
+        mutable.update{it.copy(connected=false,focused=false,volumeAvailable=false,muteAvailable=false,muted=false,muteThroughTelevision=false,device=device.endpoint.name,message="正在认证并建立加密连接…")}
+        val candidate=Companion(device.endpoint,store.credentials(device.id));connection=candidate;appleConnectionId=device.id
+        try{candidate.connect()
+            if(!foreground || connection!==candidate){candidate.close();return@operation}
+            failures=0;retryAt=0
             mutable.update{it.copy(connected=true,focused=candidate.focused,volumeAvailable=candidate.supportsVolumeSteps,message="已认证连接。请先在电视选中输入框。")}
             refreshAudio(candidate)
-            if(mutable.value.livePending)completeLiveBinding(candidate,candidate.refreshText(),bindingRequest)
-        }catch(e:Exception){candidate.close();connection=null;throw e}
+            val epoch=keyboardEpoch;val token=bindingRequest;val current=candidate.refreshText()
+            observeKeyboardField(candidate,current,epoch);completeLiveBinding(candidate,current,token)
+        }catch(e:Exception){candidate.close();if(connection===candidate)closeConnection();throw e}
+    }}
+    private suspend fun connectXiaomi(host:String){operation {
+        cancelKeyboardNavigation();disableLive();padHold?.release();padHold=null;inputs.clear();activeGesture=null
+        closeConnection();networkMute.reset()
+        withContext(Dispatchers.Main.immediate){resetKeyboardField();tvKeyboardField.reset()}
+        settings.target(ControlTarget.XIAOMI_TV);reconnect=true
+        mutable.update{it.copy(target=ControlTarget.XIAOMI_TV,powerAvailable=false,connected=false,focused=false,touching=false,volumeAvailable=false,muteAvailable=false,muted=false,muteThroughTelevision=false,device="小米电视",message="正在连接小米电视…")}
+        val candidate=MiLink(Endpoint("小米电视",host,6091));connection=candidate
+        try{
+            candidate.connect()
+            if(!foreground || connection!==candidate){candidate.close();return@operation}
+            failures=0;retryAt=0;settings.host(host)
+            mutable.update{it.copy(connected=true,xiaomiHost=host,volumeAvailable=true,muteAvailable=candidate.supportsMuteToggle,muteThroughTelevision=true,message="小米电视已连接，可以使用圆盘、返回、主页、音量和静音切换。")}
+        }catch(e:Exception){candidate.close();if(connection===candidate)closeConnection();throw e}
     }}
     fun send(confirmReplace: Boolean=false){
         val snapshot=mutable.value
-        if(snapshot.busy || snapshot.needsReview || snapshot.touching)return
+        if(snapshot.busy || snapshot.needsReview || snapshot.touching || snapshot.target!=ControlTarget.APPLE_TV)return
+        val target=keyboardField.snapshot()
         cancelKeyboardNavigation()
         disableLive()
         if(!snapshot.connected){mutable.update{it.copy(message="尚未连接 Apple TV，请先连接或配对。")};return}
         viewModelScope.launch {operation {
-            val result=(connection ?: throw ProtocolFailure("CONNECTION_CLOSED")).sendText(snapshot.text,snapshot.append,confirmReplace)
+            val result=(connection ?: throw ProtocolFailure("CONNECTION_CLOSED")).sendText(snapshot.text,snapshot.append,confirmReplace,target ?: throw ProtocolFailure("NO_FOCUSED_TEXT_FIELD"))
             val text=when(result.contextMatches){true->"协议回读相符（${result.characters} 字符）。请在电视核对实际内容。";false->"已发出文字，但协议回读不同。目标应用可能整理了内容，请查看电视；不要直接重复追加。";null->"文字事件已发出，未能确认回读。请检查电视实际内容，避免重复发送。"}
             mutable.update{it.copy(message=text,needsReview=result.contextMatches!=true)}
         }}
     }
-    private fun control(allowBusy:Boolean=false,action:(Companion)->Unit):Boolean {
+    private fun control(allowBusy:Boolean=false,action:(RemoteSession)->Unit):Boolean {
         val s=mutable.value
-        if((s.busy && !allowBusy) || s.touching || !s.connected)return false
+        if((s.busy && !allowBusy) || s.touching || !s.connected || s.pairing)return false
         val client=connection ?: return false
-        disableLive()
+        disableLive(keepFollowing=true)
         val accepted=inputs.offerClick(Control(client,action),SystemClock.elapsedRealtime())
         if(accepted)inputWake.trySend(Unit)
         return accepted
     }
     fun remote(command:Int,hold:Boolean=false){control{it.press(command,hold)}}
-    fun power(wake:Boolean){control{it.power(wake)}}
-    private fun refreshAudio(client:Companion){
+    fun power(wake:Boolean){if(mutable.value.powerAvailable)control{it.power(wake)}}
+    private fun linkedMuteHost(client:RemoteSession):String? {
+        val id=appleConnectionId ?: return null
+        if(connection!==client || client !is Companion || !settings.muteLinked(id))return null
+        return settings.host().takeIf{it.isNotBlank()}
+    }
+    fun linkCurrentMute(enabled:Boolean){
+        val s=mutable.value;val client=connection ?: return;val id=appleConnectionId ?: return
+        if(s.busy || s.pairing || !s.connected || client !is Companion || settings.host().isBlank())return
+        linkedTvMute.cancel();inputs.clear();settings.linkMute(id,enabled);networkMute.reset()
+        mutable.update{it.copy(muteThroughTelevision=enabled,muteAvailable=enabled,muted=false,
+            message=if(enabled)"当前 Apple TV 已联动小米电视静音；方向和文字输入继续控制 Apple TV。" else "已关闭当前 Apple TV 的电视静音联动。")}
+        pollWake.trySend(Unit)
+    }
+    private fun refreshAudio(client:RemoteSession){
         val level=if(client.supportsVolume)try{client.volume()}catch(e:ProtocolFailure){if(e.code!="AUDIO_UNSUPPORTED")throw e;null} else null
+        if(connection!==client || !foreground)return
         networkMute.observe(level)
-        mutable.update{it.copy(volumeAvailable=client.supportsVolumeSteps,muteAvailable=networkMute.available(level),muted=networkMute.muted)}
+        val television=client.supportsMuteToggle || linkedMuteHost(client)!=null
+        mutable.update{it.copy(volumeAvailable=client.supportsVolumeSteps,muteAvailable=television || networkMute.available(level),muted=!television && networkMute.muted,muteThroughTelevision=television)}
     }
     fun volume(up:Boolean){control{client->
         client.press(if(up)8 else 9);networkMute.reset();refreshAudio(client)
     }}
     fun mute(){control{client->
-        val muted=networkMute.toggle(client::volume,client::setVolumeVerified)
-        mutable.update{it.copy(muted=muted,muteAvailable=true)}
+        val host=linkedMuteHost(client)
+        if(host!=null){
+            fun current()=foreground && connection===client && linkedMuteHost(client)==host
+            try {
+                if(linkedTvMute.toggle(Endpoint("联动电视",host,6091),::current))mutable.update{it.copy(muted=false,muteAvailable=true,
+                    message="已向小米电视发送静音切换，Apple TV 遥控保持连接；请以电视实际声音为准。")}
+            }catch(e:Exception){
+                if(current())mutable.update{it.copy(message="电视静音未能确认，请检查小米电视是否开机及 IP；未自动重发，Apple TV 遥控保持连接。")}
+            }
+        }else if(client.supportsMuteToggle){
+            client.toggleMute()
+            mutable.update{it.copy(muted=false,muteAvailable=true,message="已发送静音切换，请以电视提示和实际声音为准；再按一次可恢复。")}
+        }else{
+            val muted=networkMute.toggle(client::volume,client::setVolumeVerified)
+            mutable.update{it.copy(muted=muted,muteAvailable=true)}
+        }
     }}
     private suspend fun operation(quiet: Boolean=false,waitForLock:Boolean=false,block: suspend ()->Unit){
         if(quiet && !waitForLock){if(!lock.tryLock())return}else lock.lock()
@@ -311,22 +435,35 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         try{withContext(Dispatchers.IO){block()}}
         catch(e:CancellationException){throw e}
         catch(e:Exception){
+            var failure=e
+            if((e as? ProtocolFailure)?.code in setOf("LIVE_TARGET_CHANGED","NO_FOCUSED_TEXT_FIELD") && foreground && keyboardVisible){
+                val client=connection;val epoch=keyboardEpoch
+                if(client!=null)try{
+                    val current=withContext(Dispatchers.IO){client.refreshText()}
+                    observeKeyboardField(client,current,epoch)
+                    return
+                }catch(next:CancellationException){throw next}catch(next:Exception){failure=next}
+            }
             disableLive()
-            val code=(e as? ProtocolFailure)?.code
-            val connectedError=code !in setOf("NO_FOCUSED_TEXT_FIELD","LIVE_TARGET_CHANGED","REPLACE_CONFIRMATION_REQUIRED","LOCAL_TEXT_LIMIT_64K","INVALID_UNICODE","AUDIO_UNSUPPORTED","MUTE_UNAVAILABLE","VOLUME_KEYS_UNAVAILABLE","KEYBOARD_SYNC_REVIEW_REQUIRED")
-            if(connectedError){padHold?.release();padHold=null;inputs.clear();connection?.close();connection=null;failures++;retryAt=System.currentTimeMillis()+minOf(30000L,1000L shl minOf(failures,5))}
+            val code=(failure as? ProtocolFailure)?.code
+            val connectedError=code !in setOf("NO_FOCUSED_TEXT_FIELD","LIVE_TARGET_CHANGED","REPLACE_CONFIRMATION_REQUIRED","LOCAL_TEXT_LIMIT_64K","INVALID_UNICODE","AUDIO_UNSUPPORTED","MUTE_UNAVAILABLE","VOLUME_KEYS_UNAVAILABLE","KEYBOARD_SYNC_REVIEW_REQUIRED","TEXT_UNSUPPORTED","POWER_UNSUPPORTED")
+            if(connectedError){padHold?.release();padHold=null;inputs.clear();closeConnection();failures++;retryAt=System.currentTimeMillis()+minOf(30000L,1000L shl minOf(failures,5))}
             mutable.update{it.copy(connected=if(connectedError)false else it.connected,focused=if(connectedError)false else it.focused,
                 volumeAvailable=if(connectedError || code=="VOLUME_KEYS_UNAVAILABLE")false else it.volumeAvailable,
                 muteAvailable=if(connectedError || code in setOf("AUDIO_UNSUPPORTED","MUTE_UNAVAILABLE"))false else it.muteAvailable,
                 muted=if(connectedError || code in setOf("AUDIO_UNSUPPORTED","MUTE_UNAVAILABLE"))false else it.muted,
-                message=errorText(e),needsReview=it.needsReview || code in setOf("WRITE_OUTCOME_UNKNOWN","KEYBOARD_SYNC_REVIEW_REQUIRED"))}
+                muteThroughTelevision=if(connectedError)false else it.muteThroughTelevision,
+                message=errorText(failure),needsReview=it.needsReview || code in setOf("WRITE_OUTCOME_UNKNOWN","KEYBOARD_SYNC_REVIEW_REQUIRED"))}
             if(code in setOf("PIN_OR_CREDENTIALS_REJECTED","DEVICE_IDENTITY_CHANGED","DEVICE_SIGNATURE_INVALID","AUTHENTICATION_TAG_INVALID"))reconnect=false
-        }finally{if(!quiet)mutable.update{it.copy(busy=false)};lock.unlock()}
+        }finally{if(!quiet)mutable.update{it.copy(busy=false)};lock.unlock();if(!quiet)pollWake.trySend(Unit)}
     }
     override fun onCleared(){stop();super.onCleared()}
     private fun errorText(e:Exception): String = when((e as? ProtocolFailure)?.code){
+        "TEXT_UNSUPPORTED"->"当前电视暂不支持文字输入，请切换到 Apple TV 使用键盘。"
+        "POWER_UNSUPPORTED"->"当前电视暂未启用网络待机或唤醒。"
+        "XIAOMI_FRAME_INVALID","XIAOMI_COMMAND_UNCONFIRMED"->"小米电视回应未能确认，已停止本次指令；没有自动重发，请查看电视。"
         "KEYBOARD_SYNC_REVIEW_REQUIRED"->"文字回读未能确认，已停止电视操作且不会重发。请查看电视，再重新开启同步或返回键盘页。"
-        "LIVE_TARGET_CHANGED"->"实时同步已停止：电视输入框已经改变。请确认新输入框后重新开启。"
+        "LIVE_TARGET_CHANGED"->"电视输入框已经改变，上一输入框的文字已停止发送。"
         "NO_FOCUSED_TEXT_FIELD"->"已连接，但当前没有可输入的文本框。请在电视选中 Emby 地址或登录输入框；某些应用不支持远程输入。"
         "PIN_OR_CREDENTIALS_REJECTED"->"验证码或配对凭据被电视拒绝。请重新配对并输入屏幕上的新验证码。"
         "PAIRING_BACKOFF","PAIRING_MAX_TRIES"->"Apple TV 限制了配对尝试，请等待一段时间后手动重试。"
@@ -342,6 +479,6 @@ class RemoteViewModel(application: Application): AndroidViewModel(application) {
         "COMMAND_REJECTED"->"Apple TV 拒绝了这条指令。请确认设备已唤醒、当前应用支持该操作。"
         "AUDIO_UNSUPPORTED","MUTE_UNAVAILABLE"->"当前输出未提供可用的网络静音切换；音量加减是独立功能。请使用电视或音响遥控器静音。"
         "VOLUME_KEYS_UNAVAILABLE"->"当前输出不支持网络音量键，请使用电视或音响遥控器。"
-        else->if(e is SocketTimeoutException)"Apple TV 响应超时。请检查 Wi-Fi、电视是否唤醒，以及 IP 和端口是否变化。" else "连接未完成或已断开。请检查同一局域网、设备隔离和 Companion 端口；自动重连不会重发文字。"
+        else->if(mutable.value.target==ControlTarget.XIAOMI_TV)"小米电视连接未完成或已断开，请确认电视已开机、IP 正确且局域网互通。连接恢复后不会重发旧按键。" else if(e is SocketTimeoutException)"Apple TV 响应超时。请检查 Wi-Fi、电视是否唤醒，以及 IP 和端口是否变化。" else "连接未完成或已断开。请检查同一局域网、设备隔离和 Companion 端口；自动重连不会重发文字。"
     }
 }

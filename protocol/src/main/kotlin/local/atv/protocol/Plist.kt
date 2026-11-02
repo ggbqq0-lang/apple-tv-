@@ -110,5 +110,9 @@ object Rti {
         val value=property(archive,"sessionUUID")
         return when(value){is ByteArray->value;is Map<*,*>->value["NS.uuidbytes"] as? ByteArray;else->null}
     }
-    fun context(archive: ByteArray): String? = property(archive,"documentState","docSt","contextBeforeInput") as? String
+    fun context(archive: ByteArray): String? {
+        val before=property(archive,"documentState","docSt","contextBeforeInput") as? String ?: return null
+        val after=property(archive,"documentState","docSt","contextAfterInput") as? String
+        return before+after.orEmpty()
+    }
 }

@@ -6,8 +6,8 @@ android {
         applicationId = "local.atv.keyboard"
         minSdk = 28
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.5.0"
+        versionCode = 11
+        versionName = "0.6.2"
     }
     buildTypes {
         release {

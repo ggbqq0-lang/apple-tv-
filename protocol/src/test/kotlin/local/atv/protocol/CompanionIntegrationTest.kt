@@ -9,6 +9,38 @@ import kotlin.concurrent.thread
 
 /** The peer here is pyatv's independent fake, NOT an actual Apple TV. */
 class CompanionIntegrationTest {
+    @Test fun switchingFieldsReadsTheNewValueAndRejectsEveryStaleWrite(){
+        val port=System.getenv("ATV_FAKE_PORT")?.toIntOrNull();val metrics=System.getenv("ATV_FAKE_METRICS")
+        assumeTrue(port!=null && metrics!=null)
+        val control=File(metrics+".field")
+        val endpoint=Endpoint("field-switch fixture","127.0.0.1",port!!)
+        control.writeText("""{"id":1,"text":"first public field"}""")
+        try{
+            val credentials=Pairing(endpoint).use{it.begin();it.finish("1111")}
+            Companion(endpoint,credentials).use{client->
+                client.connect();val tracker=KeyboardFieldTracker()
+                assertEquals("first public field",tracker.observe(client.refreshText())!!.text)
+                val staleFirst=tracker.snapshot()!!
+                control.writeText("""{"id":2,"text":"second中文"}""")
+                val changed=assertThrows(ProtocolFailure::class.java){client.sendText("old draft must not reach field 2",false,true,staleFirst)}
+                assertEquals("LIVE_TARGET_CHANGED",changed.code)
+                val second=client.refreshText();assertEquals("second中文",second.context)
+                assertEquals("second中文",tracker.observe(second)!!.text)
+                val staleSecond=tracker.snapshot()!!
+                assertEquals(true,client.sendText("new field edit",false,true,staleSecond).contextMatches)
+                control.writeText("""{"id":3,"text":""}""")
+                assertThrows(ProtocolFailure::class.java){client.sendText("previous field",false,true,staleSecond)}
+                val empty=client.refreshText();assertEquals("",empty.context)
+                assertEquals("",tracker.observe(empty)!!.text)
+                control.writeText("""{"id":4,"text":null}""")
+                val hidden=client.refreshText();assertTrue(hidden.focused);assertNull(hidden.context)
+                assertEquals("",tracker.observe(hidden)!!.text)
+                control.writeText("""{"id":4,"focused":false}""")
+                val closed=client.refreshText();assertFalse(closed.focused)
+                assertEquals("",tracker.observe(closed)!!.text);assertNull(tracker.snapshot())
+            }
+        }finally{control.delete()}
+    }
     @Test fun pairAuthenticateEncryptAndSendWithUpstreamFake(){
         val port=System.getenv("ATV_FAKE_PORT")?.toIntOrNull()
         assumeTrue("Set ATV_FAKE_PORT to the loopback pyatv fake",port!=null)
